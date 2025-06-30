@@ -47,6 +47,7 @@ PACKETDRILL_DIR="/opt/packetdrill"
 USE_CLANG="${USE_CLANG:-0}"
 MAKE_JOBS="${MAKE_JOBS:-$(nproc)}"
 INSTALL_KERNEL="${INSTALL_KERNEL:-0}"
+BTF_MODE="${BTF_MODE:-1}"  # Habilitar BTF por padrão para BPF tests
 
 log_section_start() {
     print "=== $1 ==="
@@ -77,7 +78,14 @@ check_dependencies() {
         done
     fi
     
-    # Dependências para testes
+    # Dependências específicas para BPF schedulers MPTCP
+    for dep in pahole dwarves; do
+        if ! command -v pahole &>/dev/null && ! dpkg -s "$dep" &>/dev/null && ! rpm -q "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    # Dependências para testes (opcionais)
     # for dep in iperf3 netcat-openbsd tcpdump; do
     #     if ! command -v "$dep" &>/dev/null; then
     #         missing+=("$dep")
@@ -89,6 +97,13 @@ check_dependencies() {
         printinfo "Ubuntu/Debian: sudo apt install ${missing[*]}"
         printinfo "CentOS/RHEL: sudo yum install ${missing[*]}"
         exit 1
+    fi
+    
+    # Verificar se bpftool está disponível ou será compilado
+    if ! command -v bpftool &>/dev/null; then
+        printinfo "bpftool não encontrado, será compilado junto com o kernel"
+    else
+        print "bpftool encontrado: $(which bpftool)"
     fi
     
     print "Todas as dependências estão disponíveis"
@@ -139,14 +154,27 @@ gen_kconfig() {
         done < "${SELFTESTS_DIR}/config"
     fi
     
-    # Configurações BTF (necessárias para BPF)
+    # Configurações BTF (necessárias para BPF) - sempre habilitar se BTF_MODE=1
+    if [ "$BTF_MODE" = "1" ]; then
+        print "Habilitando BTF para suporte BPF completo (schedulers MPTCP)"
+        ./scripts/config --file "${BUILD_DIR}/.config" \
+            --enable DEBUG_INFO \
+            --enable DEBUG_INFO_BTF \
+            --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+            --enable BPF \
+            --enable BPF_SYSCALL \
+            --enable BPF_JIT \
+            --enable BPF_LSM \
+            --enable BPF_PRELOAD
+    fi
+    
+    # Configurações específicas para MPTCP BPF schedulers
     ./scripts/config --file "${BUILD_DIR}/.config" \
-        --enable DEBUG_INFO \
-        --enable DEBUG_INFO_BTF \
-        --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
-        --enable BPF \
-        --enable BPF_SYSCALL \
-        --enable BPF_JIT
+        --enable MPTCP \
+        --enable MPTCP_IPV6 \
+        --enable INET_MPTCP_DIAG \
+        --enable BPF_STRUCT_OPS \
+        --enable BPF_KPROBE_OVERRIDE
     
     # Configurações de debug
     ./scripts/config --file "${BUILD_DIR}/.config" \
@@ -157,11 +185,9 @@ gen_kconfig() {
         --enable DEBUG_NET \
         --enable NET_NS_REFCNT_TRACKER
     
+    
     # Configurações extras para MPTCP
     ./scripts/config --file "${BUILD_DIR}/.config" \
-        --enable MPTCP \
-        --enable MPTCP_IPV6 \
-        --enable INET_MPTCP_DIAG \
         --enable TUN \
         --enable CRYPTO_USER_API_HASH \
         --enable CRYPTO_SHA1
@@ -176,6 +202,9 @@ gen_kconfig() {
     make "${MAKE_ARGS[@]}" olddefconfig
     
     print "Configuração do kernel gerada em ${BUILD_DIR}/.config"
+    if [ "$BTF_MODE" = "1" ]; then
+        print "BTF habilitado para testes BPF completos"
+    fi
     log_section_end
 }
 
@@ -213,7 +242,7 @@ build_selftests() {
 }
 
 build_bpftests() {
-    log_section_start "Compilando BPF tests"
+    log_section_start "Compilando BPF tests e schedulers MPTCP"
     
     if [ ! -d "${BPFTESTS_DIR}" ]; then
         printwarn "Diretório ${BPFTESTS_DIR} não encontrado, pulando BPF tests"
@@ -221,9 +250,78 @@ build_bpftests() {
     fi
     
     local headers_dir="${BUILD_DIR}/headers"
+    
+    # Compilar BPF selftests incluindo schedulers MPTCP
     make "${MAKE_ARGS[@]}" KHDR_INCLUDES="-I${headers_dir}/include" -C "${BPFTESTS_DIR}"
     
+    # Copiar test_progs para o BUILD_DIR para facilitar localização
+    if [ -f "${BPFTESTS_DIR}/test_progs" ]; then
+        cp "${BPFTESTS_DIR}/test_progs"* "${BUILD_DIR}/" 2>/dev/null || true
+        print "test_progs copiados para ${BUILD_DIR}"
+    fi
+    
+    # Verificar se os schedulers MPTCP foram compilados
+    local mptcp_schedulers=(
+        "mptcp_bpf_first.bpf.o"
+        "mptcp_bpf_rr.bpf.o" 
+        "mptcp_bpf_burst.bpf.o"
+        "mptcp_bpf_red.bpf.o"
+        "mptcp_bpf_bkup.bpf.o"
+    )
+    
+    local schedulers_found=0
+    for scheduler in "${mptcp_schedulers[@]}"; do
+        if [ -f "${BPFTESTS_DIR}/${scheduler}" ]; then
+            schedulers_found=1
+            cp "${BPFTESTS_DIR}/${scheduler}" "${BUILD_DIR}/" 2>/dev/null || true
+            print "Scheduler MPTCP compilado: ${scheduler}"
+        fi
+    done
+    
+    if [ "$schedulers_found" = "1" ]; then
+        print "Schedulers MPTCP BPF disponíveis em ${BUILD_DIR}/"
+        printinfo "Use 'bpftool struct_ops load <scheduler>.bpf.o' para carregar"
+    else
+        printwarn "Nenhum scheduler MPTCP BPF encontrado"
+    fi
+    
     print "BPF tests compilados"
+    log_section_end
+}
+
+build_bpftool() {
+    log_section_start "Compilando bpftool"
+    
+    # bpftool é essencial para carregar schedulers MPTCP BPF
+    if command -v bpftool &>/dev/null; then
+        print "bpftool já disponível: $(which bpftool)"
+        log_section_end
+        return 0
+    fi
+    
+    local bpftool_dir="tools/bpf/bpftool"
+    local headers_dir="${BUILD_DIR}/headers"
+    
+    if [ ! -d "$bpftool_dir" ]; then
+        printwarn "Diretório $bpftool_dir não encontrado"
+        log_section_end
+        return 1
+    fi
+    
+    cd "$bpftool_dir"
+    
+    # Compilar bpftool
+    make "${MAKE_ARGS[@]}" EXTRA_CFLAGS="-I${headers_dir}/include"
+    
+    # Copiar para BUILD_DIR para fácil acesso
+    cp bpftool "${BUILD_DIR}/"
+    
+    # Adicionar ao PATH temporariamente
+    export PATH="${BUILD_DIR}:${PATH}"
+    
+    cd "${KERNEL_SRC}"
+    
+    print "bpftool compilado e disponível em ${BUILD_DIR}/bpftool"
     log_section_end
 }
 
@@ -321,6 +419,101 @@ run_kunit_tests() {
     # Verificar resultados em /sys/kernel/debug/kunit/
     if [ -d "/sys/kernel/debug/kunit" ]; then
         print "Resultados KUnit disponíveis em /sys/kernel/debug/kunit/"
+        
+        # Mostrar resultados se disponíveis
+        for result_file in /sys/kernel/debug/kunit/*/results; do
+            if [ -r "$result_file" ]; then
+                local test_name=$(basename "$(dirname "$result_file")")
+                print "Resultados do KUnit test: $test_name"
+                cat "$result_file" || true
+            fi
+        done
+    fi
+    
+    log_section_end
+}
+
+run_bpf_test_progs() {
+    log_section_start "Executando BPF test_progs"
+    
+    # Verificar se estamos no modo BTF (necessário para BPF)
+    if [ ! -f "${BUILD_DIR}/.config" ] || ! grep -q "CONFIG_DEBUG_INFO_BTF=y" "${BUILD_DIR}/.config"; then
+        printwarn "BTF não habilitado, pulando BPF test_progs"
+        printwarn "Para executar BPF tests, use: BTF_MODE=1 $0"
+        log_section_end
+        return 0
+    fi
+    
+    # Procurar por executáveis test_progs compilados
+    local test_progs_found=0
+    for test_prog in "${BUILD_DIR}/test_progs"*; do
+        if [ -x "$test_prog" ]; then
+            test_progs_found=1
+            local prog_name=$(basename "$test_prog")
+            print "Executando BPF test: $prog_name"
+            
+            # Executar test_progs com filtro para testes MPTCP se disponível
+            if "$test_prog" --help 2>&1 | grep -q "\-t.*test.*filter"; then
+                "$test_prog" -t mptcp || true
+            else
+                "$test_prog" || true
+            fi
+        fi
+    done
+    
+    if [ "$test_progs_found" = "0" ]; then
+        printwarn "Nenhum test_progs encontrado em ${BUILD_DIR}"
+        printwarn "Certifique-se de que os BPF tests foram compilados"
+    fi
+    
+    log_section_end
+}
+
+test_mptcp_schedulers() {
+    log_section_start "Testando carregamento de schedulers MPTCP BPF"
+    
+    # Verificar se bpftool está disponível
+    if ! command -v bpftool &>/dev/null && ! [ -x "${BUILD_DIR}/bpftool" ]; then
+        printwarn "bpftool não disponível, pulando teste de schedulers"
+        log_section_end
+        return 0
+    fi
+    
+    local bpftool_cmd="bpftool"
+    if [ -x "${BUILD_DIR}/bpftool" ]; then
+        bpftool_cmd="${BUILD_DIR}/bpftool"
+    fi
+    
+    # Verificar schedulers disponíveis
+    print "Schedulers MPTCP disponíveis:"
+    ls -la "${BUILD_DIR}"/mptcp_bpf_*.o 2>/dev/null || {
+        printwarn "Nenhum scheduler MPTCP encontrado em ${BUILD_DIR}"
+        log_section_end
+        return 0
+    }
+    
+    # Testar carregamento de um scheduler (exemplo: first)
+    local test_scheduler="${BUILD_DIR}/mptcp_bpf_first.bpf.o"
+    if [ -f "$test_scheduler" ]; then
+        print "Testando carregamento do scheduler 'first'..."
+        
+        # Tentar carregar o scheduler
+        if sudo "$bpftool_cmd" struct_ops load "$test_scheduler"; then
+            print "✓ Scheduler 'first' carregado com sucesso!"
+            
+            # Mostrar struct_ops carregados
+            print "Struct_ops BPF carregados:"
+            sudo "$bpftool_cmd" struct_ops show || true
+            
+            # Mostrar schedulers MPTCP disponíveis no sistema
+            print "Schedulers MPTCP disponíveis no sistema:"
+            cat /proc/sys/net/mptcp/scheduler 2>/dev/null || true
+            
+        else
+            printwarn "Falha ao carregar scheduler 'first'"
+        fi
+    else
+        printwarn "Scheduler de teste não encontrado: $test_scheduler"
     fi
     
     log_section_end
@@ -332,6 +525,11 @@ show_summary() {
     print "Build completo!"
     printinfo "Kernel compilado em: ${BUILD_DIR}"
     printinfo "Selftests disponíveis em: ${SELFTESTS_DIR}"
+    printinfo "Schedulers MPTCP BPF em: ${BUILD_DIR}/mptcp_bpf_*.bpf.o"
+    
+    if [ -x "${BUILD_DIR}/bpftool" ]; then
+        printinfo "bpftool disponível em: ${BUILD_DIR}/bpftool"
+    fi
     
     if [ "$INSTALL_KERNEL" = "1" ]; then
         printinfo "Kernel instalado - reinicie para usar"
@@ -339,7 +537,13 @@ show_summary() {
         printinfo "Para instalar o kernel: INSTALL_KERNEL=1 $0"
     fi
     
-    printinfo "Para executar apenas os testes: $0 test"
+    printinfo "Para executar testes: $0 test"
+    printinfo "Para testar schedulers: $0 schedulers"
+    
+    print ""
+    print "Como usar schedulers MPTCP BPF:"
+    print "1. sudo ${BUILD_DIR}/bpftool struct_ops load ${BUILD_DIR}/mptcp_bpf_first.bpf.o"
+    print "2. echo 'bpf_first' | sudo tee /proc/sys/net/mptcp/scheduler"
     
     log_section_end
 }
@@ -351,6 +555,7 @@ case "${1:-build}" in
         gen_kconfig
         build_kernel
         install_kernel_headers
+        build_bpftool
         build_selftests
         build_bpftests
         install_kernel
@@ -359,6 +564,8 @@ case "${1:-build}" in
     "test")
         run_selftests
         run_kunit_tests
+        run_bpf_test_progs
+        test_mptcp_schedulers
         ;;
     "install")
         INSTALL_KERNEL=1
@@ -369,17 +576,22 @@ case "${1:-build}" in
         gen_kconfig
         print "Configuração gerada em ${BUILD_DIR}/.config"
         ;;
+    "schedulers")
+        test_mptcp_schedulers
+        ;;
     *)
-        echo "Uso: $0 [build|test|install|config]"
-        echo "  build  - Compila kernel e testes (padrão)"
-        echo "  test   - Executa apenas os testes"
-        echo "  install- Instala o kernel compilado"
-        echo "  config - Gera apenas a configuração"
+        echo "Uso: $0 [build|test|install|config|schedulers]"
+        echo "  build      - Compila kernel e testes (padrão)"
+        echo "  test       - Executa todos os testes"
+        echo "  install    - Instala o kernel compilado"
+        echo "  config     - Gera apenas a configuração"
+        echo "  schedulers - Testa carregamento de schedulers MPTCP BPF"
         echo
         echo "Variáveis de ambiente:"
         echo "  USE_CLANG=1     - Usar Clang em vez de GCC"
         echo "  MAKE_JOBS=N     - Número de jobs paralelos"
         echo "  INSTALL_KERNEL=1- Instalar kernel automaticamente"
+        echo "  BTF_MODE=1      - Habilitar BTF para BPF tests (padrão)"
         exit 1
         ;;
 esac
