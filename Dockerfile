@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
-FROM ubuntu:25.04
+FROM ubuntu:25.10
 
 LABEL name=mptcp-upstream-virtme-docker
 
@@ -9,7 +9,7 @@ RUN apt-get update && \
 	apt-get dist-upgrade -y && \
 	DEBIAN_FRONTEND=noninteractive \
 	apt-get install -y --no-install-recommends \
-		build-essential libncurses5-dev gcc libssl-dev bc bison byacc automake \
+		build-essential libncurses5-dev gcc libssl-dev bc bison byacc automake cmake \
 		libelf-dev flex git curl tar hashalot qemu-kvm sudo expect \
 		python3 python3-pip python3-pkg-resources file virtiofsd \
 		busybox-static coreutils python3-requests libvirt-clients udev \
@@ -19,9 +19,9 @@ RUN apt-get update && \
 		tcpdump \
 		pkgconf libmnl-dev libxtables-dev libatm1-dev libbsd-dev libbpf-dev gcc-multilib libcap-dev libdb-dev libnsl-dev libselinux1-dev zlib1g-dev \
 		clang clangd clang-tidy lld llvm llvm-dev libcap-dev \
-		gdb gdb-multiarch crash dwarves strace trace-cmd \
+		gdb gdb-multiarch crash dwarves strace trace-cmd linux-perf \
 		iptables ebtables nftables bridge-utils socat \
-		vim psmisc bash-completion less jq \
+		vim psmisc bash-completion less jq xxd moreutils time bsdextrautils htop \
 		gettext-base libevent-dev libtraceevent-dev libnewt0.52 libslang2 libutempter0 python3-newt tmux gawk \
 		libdwarf-dev libbfd-dev libnuma-dev libzstd-dev libunwind-dev libdw-dev libslang2-dev python3-dev python3-setuptools binutils-dev libiberty-dev libbabeltrace-dev systemtap-sdt-dev libperl-dev python3-docutils \
 		libtap-formatter-junit-perl lcov libjson-xs-perl \
@@ -32,20 +32,22 @@ RUN apt-get update && \
 		golang \
 		mptcpize iperf3 netperf \
 		bmon ifstat dstat \
+		stress-ng \
 		python3-pexpect \
+		nvme-cli fio keyutils ktls-utils libnss-myhostname \
 		&& \
 	apt-get clean
 
 # byobu (not to have a dep to iproute2)
-ARG BYOBU_URL="https://github.com/dustinkirkland/byobu/archive/refs/tags/6.13.tar.gz"
-ARG BYOBU_SUM="9690c629588e8f95d16b2461950d39934faaf8005dd2a283886d4e3bd6c86df6  byobu.tar.gz"
+ARG BYOBU_URL="https://github.com/dustinkirkland/byobu/archive/refs/tags/6.14.tar.gz"
+ARG BYOBU_SUM="478e15a38a57678e4bd2cd55994ea1edece2d10bb6bf0a3de8f0b2dd8df35485  byobu.tar.gz"
 RUN cd /opt && \
 	curl -L "${BYOBU_URL}" -o byobu.tar.gz && \
 	echo "${BYOBU_SUM}" | sha256sum -c && \
 	tar xzf byobu.tar.gz && \
 	cd byobu-*/ && \
 		./autogen.sh && \
-		./configure --prefix=/usr && \
+		./configure --prefix=/usr --sysconfdir=/etc && \
 		make -j"$(nproc)" -l"$(nproc)" && \
 		make install
 
@@ -65,8 +67,8 @@ RUN cd /opt && \
 				/usr/sbin/
 
 # Sparse
-ARG SPARSE_GIT_URL="git://git.kernel.org/pub/scm/devel/sparse/sparse.git"
-ARG SPARSE_GIT_SHA="09411a7a5127516a0741eb1bd8762642fa9197ce" # include a fix for 'unreplaced' issues and llvm 16
+ARG SPARSE_GIT_URL="https://kernel.googlesource.com/pub/scm/devel/sparse/sparse.git"
+ARG SPARSE_GIT_SHA="37156835e3d725b6d750f000be33ba3814bb2310" # include a fix for __builtin_strlen
 RUN cd /opt && \
 	git clone "${SPARSE_GIT_URL}" sparse && \
 	cd "sparse" && \
@@ -76,9 +78,26 @@ RUN cd /opt && \
 		cd .. && \
 	rm -rf "sparse"
 
+# Pahole
+ARG PAHOLE_GIT_URL="git://git.kernel.org/pub/scm/devel/pahole/pahole.git"
+ARG PAHOLE_GIT_SHA="v1.31"
+RUN cd /opt && \
+	git clone "${PAHOLE_GIT_URL}" pahole && \
+	cd "pahole" && \
+		git checkout "${PAHOLE_GIT_SHA}" && \
+		git submodule update --init --recursive && \
+		mkdir build && \
+		cd build && \
+		cmake .. && \
+		make -j"$(nproc)" -l"$(nproc)" && \
+		make install && \
+		ldconfig && \
+		cd .. && \
+	rm -rf "pahole"
+
 # iproute
-ARG IPROUTE2_GIT_URL="git://git.kernel.org/pub/scm/network/iproute2/iproute2.git"
-ARG IPROUTE2_GIT_SHA="v6.15.0"
+ARG IPROUTE2_GIT_URL="https://kernel.googlesource.com/pub/scm/network/iproute2/iproute2.git"
+ARG IPROUTE2_GIT_SHA="v6.19.0"
 RUN cd /opt && \
 	git clone "${IPROUTE2_GIT_URL}" iproute2 && \
 	cd iproute2 && \
@@ -88,7 +107,7 @@ RUN cd /opt && \
 		make install
 
 # Virtme NG
-ARG VIRTME_NG_VERSION="1.36"
+ARG VIRTME_NG_VERSION="1.41"
 RUN pip3 install --break-system-packages virtme-ng=="${VIRTME_NG_VERSION}"
 
 # to quickly shutdown the VM and more

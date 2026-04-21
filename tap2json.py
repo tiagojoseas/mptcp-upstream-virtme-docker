@@ -30,6 +30,8 @@ def get_args_parser():
         help="Add extra info in the JSON, can be used multiple times",
     )
 
+    parser.add_argument("--error", "-e", action="store", help="Append error message")
+
     parser.add_argument(
         "--only-fails", "-f", action="store_true", help="Only keep failed tests"
     )
@@ -37,6 +39,8 @@ def get_args_parser():
     parser.add_argument(
         "tapfiles", metavar="tapfiles", type=str, nargs="*", help="Input TAP file(s)"
     )
+
+    parser.add_argument("--warn", "-w", action="store", help="Append warning message")
 
     return parser
 
@@ -121,6 +125,15 @@ def add_info(results, infos):
     return results
 
 
+def add_field(results, key, val):
+    if "results" not in results:
+        results = {"results": results}
+
+    results[key] = val
+
+    return results
+
+
 def write_json(out_file, results):
     out = json.dumps(results)
     if out_file:
@@ -142,5 +155,11 @@ if __name__ == "__main__":
 
     if args.info:
         main_results = add_info(main_results, args.info)
+
+    if args.error:
+        main_results = add_field(main_results, "error", args.error)
+
+    if args.warn:
+        main_results = add_field(main_results, "warn", args.warn)
 
     write_json(args.output, main_results)
